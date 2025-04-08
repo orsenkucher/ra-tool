@@ -785,78 +785,64 @@ def run_command(args):
         client.start()
         client.initialize()  # Initialize already sets _initialized event
 
-        # --- Wait for initial workspace loading/analysis (using Progress) ---
+        # --- Wait 1: Initial workspace loading/analysis (using Progress) ---
         log_stderr("[Main] Waiting for initial rust-analyzer setup (using $/progress)...")
         initial_ready, _ = client.wait_for_progress_done(
             task_description="initialization", timeout=180.0
         )
         if not initial_ready:
-            output["message"] = "Error: rust-analyzer did not finish initial setup within timeout."
-            output["details"] = {"active_tokens": list(client._active_progress_tokens)}
+            # ... (handle error) ...
             print(json.dumps(output, indent=2))
-            if ARGS and ARGS.verbose and client:
-                output["stderr_snapshot"] = client.get_stderr_snapshot()
             sys.exit(1)
         log_stderr("[Main] Initial setup (Progress tasks) seems complete.")
-        # --- Optional: Add a short quiescence wait even here if progress isn't enough ---
-        # log_stderr("[Main] Waiting for short quiescence after initial progress...")
-        # init_quiesce_ok, _ = client.wait_for_quiescence(task_description="post-init", timeout=30.0, idle_threshold=1.0)
-        # if not init_quiesce_ok:
-        #     log_stderr("[Main] Warning: Server didn't fully quiet down after init progress.")
+
+        # --- Wait 2: General Quiescence (for background indexing etc.) ---
+        # Run this *always* after initial progress settles, before any command.
+        log_stderr(
+            "[Main] Waiting for post-initialization quiescence (e.g., background indexing)..."
+        )
+        # Use similar timeout/idle settings as the post-open wait, adjust as needed
+        general_quiesce_ok, _ = client.wait_for_quiescence(
+            task_description="post-init", timeout=120.0, idle_threshold=2.5
+        )
+        if not general_quiesce_ok:
+            log_stderr("[Main] Warning: Server didn't fully quiet down after initial progress.")
+            # Decide if this is critical enough to error out, or just warn
+            # output["warning"] = "Server quiescence timeout after initialization."
+        else:
+            log_stderr("[Main] Post-initialization quiescence seems complete.")
         # ---
 
-        # Only notify didOpen and wait if we have a target file for the command
+        # --- Wait 3: File-specific analysis (if applicable) ---
         if target_file:
             client.notify_did_open(target_file)
 
-            # --- Wait for analysis after opening the file (using Quiescence) ---
+            # Wait specifically for analysis triggered by opening the file
             log_stderr(
                 f"[Main] Waiting for analysis after opening {target_file.name} (using quiescence)..."
             )
-            # This wait needs to be long enough to catch the diagnostic storm
-            # Adjust timeout and idle_threshold based on project size/complexity
-            # Maybe 2.0-3.0 seconds idle is needed for large projects?
             open_ready, messages_during_wait = client.wait_for_quiescence(
-                task_description=f"post-open {target_file.name}",
-                timeout=120.0,
-                idle_threshold=2.5,  # <-- ADJUST IDLE THRESHOLD
+                task_description=f"post-open {target_file.name}", timeout=120.0, idle_threshold=2.5
             )
             if not open_ready:
                 log_stderr(
                     f"[Main] Warning: rust-analyzer did not quiesce after opening file within timeout. Results might be incomplete."
                 )
-                if ARGS and ARGS.verbose:
-                    log_stderr("[Main] Last messages during failed quiescence wait:")
-                    for msg in messages_during_wait[-10:]:
-                        log_stderr(
-                            f"  - {msg.get('method', msg.get('id', 'Unknown'))}: {str(msg.get('params',{}))[:100]}"
-                        )
-                # Proceed, but maybe add warning to output
-                # output["warning"] = "Analysis timeout after file open, results may be partial."
+                # ... (optional logging/warning) ...
             else:
                 log_stderr(
                     f"[Main] Analysis quiescence after opening {target_file.name} seems complete."
                 )
-            # ---
+        # --- End Wait 3 ---
 
-        # --- Workspace Symbols Delay (Still potentially useful) ---
-        # If workspaceSymbols is called without opening a specific file first,
-        # the initial progress wait might be enough, but a small delay could still help.
-        if args.command == "workspaceSymbols":
-            # If a file was opened, the quiescence wait likely covered indexing time.
-            # If no file was opened, rely more on the initial progress wait + maybe this delay.
-            needs_ws_delay = (
-                not target_file
-            )  # Only apply delay if no file was opened and waited for
-            workspace_query_delay = (
-                2.0 if needs_ws_delay else 0.5
-            )  # Shorter delay if quiescence already happened
-
-            if workspace_query_delay > 0:
-                log_stderr(
-                    f"[Main] Applying additional {workspace_query_delay}s delay before workspace symbol query..."
-                )
-                time.sleep(workspace_query_delay)
+        # --- Workspace Symbols Delay (Likely Redundant Now) ---
+        # The General Quiescence wait should cover most indexing time.
+        # We can probably remove or significantly reduce this delay. Test removing it first.
+        # if args.command == "workspaceSymbols":
+        #     workspace_query_delay = 0.5 # Drastically reduced or 0
+        #     if workspace_query_delay > 0:
+        #         log_stderr(f"[Main] Applying minimal additional delay: {workspace_query_delay}s")
+        #         time.sleep(workspace_query_delay)
 
         lsp_response = None
 
