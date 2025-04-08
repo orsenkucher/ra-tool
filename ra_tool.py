@@ -84,6 +84,7 @@ class RustAnalyzerLSPClient:
         self._stderr_lines = []
         self._stderr_reader_thread = None
         self._stop_stderr_reader = threading.Event()
+        self._active_progress_tokens = set()
 
     def _encode_message(self, message):
         json_message = json.dumps(message, separators=(",", ":"))
@@ -164,6 +165,218 @@ class RustAnalyzerLSPClient:
                     log_stderr(f"[Reader] Error reading stdout: {e}")
                 break
         log_stderr("[Reader] stdout Thread finished.")
+
+    def wait_for_progress_done(self, task_description: str = "analysis", timeout: float = 180.0):
+        """
+        Waits for rust-analyzer to finish background tasks signaled via $/progress.
+
+        Specifically waits until all active progress tokens have received an 'end' message.
+        """
+        log_stderr(f"[Wait] Waiting for '{task_description}' to complete (max {timeout}s)...")
+        start_time = time.monotonic()
+        initial_tokens = set(self._active_progress_tokens)  # Copy tokens active *before* this wait
+        log_stderr(
+            f"[Wait] Initially active tokens: {initial_tokens if initial_tokens else 'None'}"
+        )
+
+        if not initial_tokens:
+            log_stderr("[Wait] No tasks were active at the start of the wait.")
+            # Still might need to wait for NEW tasks started by the previous action (e.g. didOpen)
+            # We'll rely on the loop below to catch newly started tasks.
+
+        processed_messages = []
+
+        while time.monotonic() - start_time < timeout:
+            if self.process.poll() is not None:
+                log_stderr(
+                    f"[Wait] rust-analyzer process terminated during wait (exit code: {self.process.poll()})."
+                )
+                return False, processed_messages  # Indicate failure
+
+            try:
+                # Poll with short timeout to remain responsive
+                message = self.message_queue.get(timeout=0.2)
+                processed_messages.append(message)
+                message_processed = False  # Flag to check if we handled the message
+
+                if message.get("method") == "$/progress":
+                    params = message.get("params", {})
+                    token = params.get("token")
+                    value = params.get("value", {})
+                    kind = value.get("kind")
+
+                    if token is not None:
+                        if kind == "begin":
+                            self._active_progress_tokens.add(token)
+                            title = value.get('title', '')
+                            msg = value.get('message', '')
+                            log_stderr(
+                                f"[Wait Progress] BEGIN '{title}': {msg} (Token: {token}). Active: {self._active_progress_tokens}"
+                            )
+                            message_processed = True
+                        elif kind == "report":
+                            # Optionally log report messages if verbose
+                            if ARGS and ARGS.verbose:
+                                msg = value.get('message', '')
+                                percentage = value.get('percentage', '')
+                                percent_str = (
+                                    f" ({percentage}%)"
+                                    if isinstance(percentage, (int, float))
+                                    else ""
+                                )
+                                log_stderr(
+                                    f"[Wait Progress] REPORT (Token: {token}): {msg}{percent_str}"
+                                )
+                            message_processed = True  # Handled (even if just logging)
+                        elif kind == "end":
+                            self._active_progress_tokens.discard(
+                                token
+                            )  # Use discard to avoid error if not present
+                            msg = value.get('message', '')
+                            log_stderr(
+                                f"[Wait Progress] END (Token: {token}): {msg}. Active: {self._active_progress_tokens}"
+                            )
+                            message_processed = True
+                            # --- Check completion ---
+                            # We consider the wait complete if *no* tokens are active anymore.
+                            # This is simpler than tracking specific titles.
+                            if not self._active_progress_tokens:
+                                log_stderr(
+                                    f"[Wait] All progress tasks finished after {(time.monotonic() - start_time):.2f}s."
+                                )
+                                return True, processed_messages  # Success!
+
+                    else:
+                        log_stderr(
+                            f"[Wait Progress] Warning: Received $/progress without token: {params}"
+                        )
+                        message_processed = True
+
+                # --- Handle other messages received during wait ---
+                if not message_processed and "method" in message:
+                    method = message['method']
+                    # Log diagnostics/logs even during wait if verbose
+                    if method == 'window/logMessage' and ARGS and ARGS.verbose:
+                        log_stderr(f"[RA Log Wait] {message['params'].get('message', '')}")
+                    elif method == 'textDocument/publishDiagnostics' and ARGS and ARGS.verbose:
+                        diag_count = len(message['params'].get('diagnostics', []))
+                        uri_tail = message['params'].get('uri', '').split('/')[-1]
+                        log_stderr(f"[RA Diag Wait] {uri_tail}: {diag_count} diagnostics")
+                    # TODO: Handle window/workDoneProgress/create if RA requires response
+                    # elif method == 'window/workDoneProgress/create':
+                    #    pass # Send success response back
+                    elif ARGS and ARGS.verbose:
+                        log_stderr(f"[RA Notify Wait] Method: {method}")
+
+                # --- Check if initially empty set remains empty ---
+                # If we started with no active tokens, and still have none after polling,
+                # and some time has passed, maybe analysis was very fast or didn't trigger progress.
+                # Add a small delay check to avoid exiting instantly if the first poll is empty.
+                if not self._active_progress_tokens and time.monotonic() - start_time > 0.5:
+                    log_stderr(
+                        f"[Wait] No active progress tokens detected after {(time.monotonic() - start_time):.2f}s. Assuming complete."
+                    )
+                    return True, processed_messages  # Assume complete
+
+            except queue.Empty:
+                # Queue empty, check if tasks are done
+                if not self._active_progress_tokens:
+                    # Check again, maybe the END message was processed just before queue became empty
+                    log_stderr(
+                        f"[Wait] Queue empty and no active tasks remaining after {(time.monotonic() - start_time):.2f}s."
+                    )
+                    return True, processed_messages  # Success!
+                # Otherwise, continue waiting for messages or timeout
+                continue
+
+        log_stderr(f"[Wait] Timeout ({timeout}s) reached while waiting for '{task_description}'.")
+        log_stderr(f"[Wait] Still active tokens: {self._active_progress_tokens}")
+        return False, processed_messages  # Indicate timeout
+
+    def wait_for_quiescence(
+        self, task_description: str = "activity", timeout: float = 60.0, idle_threshold: float = 1.5
+    ):
+        """Waits until no messages are received for idle_threshold seconds."""
+        log_stderr(
+            f"[Wait] Waiting for rust-analyzer quiescence ({task_description}, max {timeout}s, idle {idle_threshold}s)..."
+        )
+        start_time = time.monotonic()
+        last_message_time = time.monotonic()
+        processed_messages = []
+
+        while time.monotonic() - start_time < timeout:
+            if self.process.poll() is not None:
+                log_stderr(
+                    f"[Wait Quiesce] rust-analyzer process terminated during wait (exit code: {self.process.poll()})."
+                )
+                return False, processed_messages  # Indicate failure
+
+            try:
+                # Poll with short timeout
+                message = self.message_queue.get(timeout=0.1)
+                last_message_time = time.monotonic()  # Reset timer on message
+                processed_messages.append(message)  # Store message
+                message_processed = False  # Flag
+
+                # --- Basic processing of messages received *during* wait ---
+                if message.get("method") == "$/progress":
+                    # Handle progress messages minimally to keep state updated
+                    params = message.get("params", {})
+                    token = params.get("token")
+                    value = params.get("value", {})
+                    kind = value.get("kind")
+                    if token is not None:
+                        if kind == "begin":
+                            self._active_progress_tokens.add(token)
+                            if ARGS and ARGS.verbose:
+                                log_stderr(
+                                    f"[Wait Quiesce Progress] BEGIN {token}. Active: {self._active_progress_tokens}"
+                                )
+                        elif kind == "end":
+                            self._active_progress_tokens.discard(token)
+                            if ARGS and ARGS.verbose:
+                                log_stderr(
+                                    f"[Wait Quiesce Progress] END {token}. Active: {self._active_progress_tokens}"
+                                )
+                    message_processed = True
+
+                elif "method" in message and not message_processed:
+                    method = message['method']
+                    if method == 'window/logMessage' and ARGS and ARGS.verbose:
+                        log_stderr(f"[RA Log Quiesce] {message['params'].get('message', '')}")
+                        message_processed = True
+                    elif method == 'textDocument/publishDiagnostics':
+                        if ARGS and ARGS.verbose:
+                            diag_count = len(message['params'].get('diagnostics', []))
+                            uri_tail = message['params'].get('uri', '').split('/')[-1]
+                            log_stderr(f"[RA Diag Quiesce] {uri_tail}: {diag_count} diagnostics")
+                        # We see diagnostics, so reset the idle timer implicitly by falling through
+                        message_processed = True  # Mark as processed
+                    # Ignore window/workDoneProgress/create for now unless causing issues
+                    # elif method == 'window/workDoneProgress/create':
+                    #    message_processed = True # Ignore
+
+                # --- End basic processing ---
+
+            except queue.Empty:
+                # No message received in the last 0.1s
+                idle_time = time.monotonic() - last_message_time
+                if idle_time > idle_threshold:
+                    log_stderr(
+                        f"[Wait Quiesce] Server quiescent for {idle_time:.2f}s after receiving {len(processed_messages)} messages during this wait. Proceeding."
+                    )
+                    return True, processed_messages  # Success
+                # Else: Queue was empty, but not idle long enough yet, continue loop.
+            except Exception as e:
+                log_stderr(f"[Wait Quiesce] Error during quiescence wait: {e}")
+                return False, processed_messages  # Indicate failure
+
+        log_stderr(
+            f"[Wait Quiesce] Timeout ({timeout}s) reached while waiting for quiescence ({task_description}) after {len(processed_messages)} messages."
+        )
+        return False, processed_messages  # Indicate timeout
+
+    # --- End wait_for_quiescence ---
 
     def start(self):
         log_stderr(f"Starting rust-analyzer for project: {self.project_root}")
@@ -267,6 +480,7 @@ class RustAnalyzerLSPClient:
                 "processId": os.getpid(),
                 "rootUri": self.project_root.as_uri(),
                 "capabilities": {
+                    "window": {"workDoneProgress": True},
                     "textDocument": {
                         "synchronization": {"dynamicRegistration": False},
                         "hover": {"contentFormat": ["markdown", "plaintext"]},
@@ -277,7 +491,7 @@ class RustAnalyzerLSPClient:
                     },
                     "workspace": {"workspaceFolders": True, "symbol": {}},
                 },
-                "clientInfo": {"name": "PythonRAClientCLI", "version": "0.3"},  # Ver bump
+                "clientInfo": {"name": "PythonRAClientCLI", "version": "0.3"},
                 "workspaceFolders": [
                     {"uri": self.project_root.as_uri(), "name": self.project_root.name}
                 ],
@@ -292,50 +506,77 @@ class RustAnalyzerLSPClient:
         init_response = None
         while time.monotonic() - start_time < RESPONSE_TIMEOUT:
             try:
-                message = self.message_queue.get(timeout=0.5)
+                # Use a shorter timeout here to be responsive to other messages
+                message = self.message_queue.get(timeout=0.2)
                 if message.get("id") == init_id:
                     init_response = message
                     break
+                elif "method" in message:
+                    # Handle potential early progress/log messages if needed/verbose
+                    method = message['method']
+                    if method == 'window/logMessage' and ARGS and ARGS.verbose:
+                        log_stderr(f"[RA Log InitWait] {message['params'].get('message', '')}")
+                    # Note: Technically, we might get window/workDoneProgress/create *before*
+                    # the initialize response. We will ignore it for now, assuming rust-analyzer
+                    # proceeds without explicit create confirmation if capability is set.
+                    elif ARGS and ARGS.verbose:
+                        log_stderr(f"[Main] Received other message during init wait: {method}")
                 else:
-                    # Handle other messages received during init if necessary
-                    log_stderr(
-                        f"[Main] Received other message during init wait: {message.get('method', message.get('id'))}"
-                    )
+                    if ARGS and ARGS.verbose:
+                        log_stderr(
+                            f"[Main] Received unexpected message during init wait: {message}"
+                        )
+
             except queue.Empty:
                 if self.process.poll() is not None:
                     raise RuntimeError(
-                        f"RA process died during init (exit code: {self.process.poll()})."
+                        f"RA process died during init (exit code: {self.process.poll()}). Stderr:\n{self.get_stderr_snapshot()}"
                     )
-                continue
+                continue  # Continue waiting if process is alive
 
         if init_response is None:
-            raise TimeoutError("Timeout waiting for initialize response")
+            raise TimeoutError(
+                f"Timeout waiting for initialize response. Stderr:\n{self.get_stderr_snapshot()}"
+            )
         if "error" in init_response:
-            raise RuntimeError(f"Initialization failed: {init_response['error']}")
+            raise RuntimeError(
+                f"Initialization failed: {init_response['error']}. Stderr:\n{self.get_stderr_snapshot()}"
+            )
 
         log_stderr("[Main] Received Initialize Response.")
         self.send_notification("initialized", {})
         self._initialized.set()
         log_stderr("[Main] Sent Initialized Notification. Client is ready.")
-        time.sleep(0.2)
+        # No sleep needed here now, we will wait properly later
+        # time.sleep(0.2)
 
+    # Make sure notify_did_open does NOT have the hardcoded sleep anymore
     def notify_did_open(self, file_path: Path):
-        # ... (remains the same, uses log_stderr) ...
         if not file_path.is_file():
             log_stderr(f"[Notify] File not found for didOpen: {file_path}")
-            return
+            return  # Or raise error?
         uri = file_path.as_uri()
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                text = f.read()
+            # Ensure file is read correctly
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    text = f.read()
+            except UnicodeDecodeError:
+                log_stderr(
+                    f"[Notify] Warning: UTF-8 decode failed for {file_path}. Trying fallback encoding."
+                )
+                with open(file_path, 'r', encoding='latin-1') as f:  # Or other fallback
+                    text = f.read()
+
             self.send_notification(
                 "textDocument/didOpen",
                 {"textDocument": {"uri": uri, "languageId": "rust", "version": 1, "text": text}},
             )
             log_stderr(f"[Notify] Sent didOpen for {uri}")
-            time.sleep(0.7)
+            # time.sleep(0.7) # <<< REMOVE or COMMENT OUT the old sleep
         except Exception as e:
             log_stderr(f"[Notify] Failed to send didOpen for {uri}: {e}")
+            # Consider re-raising or handling more robustly
 
     def shutdown(self):
         log_stderr("[Main] Initiating shutdown...")
@@ -531,19 +772,91 @@ def run_command(args):
     structured_result = None
     lsp_error = None
 
+    output = {
+        "status": "error",
+        "message": "Command failed before execution",
+        "details": None,
+    }  # Default error
+
+    client = None  # Define client initially as None
+
     try:
+        client = RustAnalyzerLSPClient(project_root=Path.cwd())
         client.start()
-        client.initialize()
-        # Only notify didOpen if we have a target file for the command
+        client.initialize()  # Initialize already sets _initialized event
+
+        # --- Wait for initial workspace loading/analysis (using Progress) ---
+        log_stderr("[Main] Waiting for initial rust-analyzer setup (using $/progress)...")
+        initial_ready, _ = client.wait_for_progress_done(
+            task_description="initialization", timeout=180.0
+        )
+        if not initial_ready:
+            output["message"] = "Error: rust-analyzer did not finish initial setup within timeout."
+            output["details"] = {"active_tokens": list(client._active_progress_tokens)}
+            print(json.dumps(output, indent=2))
+            if ARGS and ARGS.verbose and client:
+                output["stderr_snapshot"] = client.get_stderr_snapshot()
+            sys.exit(1)
+        log_stderr("[Main] Initial setup (Progress tasks) seems complete.")
+        # --- Optional: Add a short quiescence wait even here if progress isn't enough ---
+        # log_stderr("[Main] Waiting for short quiescence after initial progress...")
+        # init_quiesce_ok, _ = client.wait_for_quiescence(task_description="post-init", timeout=30.0, idle_threshold=1.0)
+        # if not init_quiesce_ok:
+        #     log_stderr("[Main] Warning: Server didn't fully quiet down after init progress.")
+        # ---
+
+        # Only notify didOpen and wait if we have a target file for the command
         if target_file:
             client.notify_did_open(target_file)
 
-        if args.command == "workspaceSymbols":
-            workspace_query_delay = 2.0  # Seconds - adjust if needed for larger projects
+            # --- Wait for analysis after opening the file (using Quiescence) ---
             log_stderr(
-                f"[Main] Applying {workspace_query_delay}s delay for workspace symbol indexing..."
+                f"[Main] Waiting for analysis after opening {target_file.name} (using quiescence)..."
             )
-            time.sleep(workspace_query_delay)
+            # This wait needs to be long enough to catch the diagnostic storm
+            # Adjust timeout and idle_threshold based on project size/complexity
+            # Maybe 2.0-3.0 seconds idle is needed for large projects?
+            open_ready, messages_during_wait = client.wait_for_quiescence(
+                task_description=f"post-open {target_file.name}",
+                timeout=120.0,
+                idle_threshold=2.5,  # <-- ADJUST IDLE THRESHOLD
+            )
+            if not open_ready:
+                log_stderr(
+                    f"[Main] Warning: rust-analyzer did not quiesce after opening file within timeout. Results might be incomplete."
+                )
+                if ARGS and ARGS.verbose:
+                    log_stderr("[Main] Last messages during failed quiescence wait:")
+                    for msg in messages_during_wait[-10:]:
+                        log_stderr(
+                            f"  - {msg.get('method', msg.get('id', 'Unknown'))}: {str(msg.get('params',{}))[:100]}"
+                        )
+                # Proceed, but maybe add warning to output
+                # output["warning"] = "Analysis timeout after file open, results may be partial."
+            else:
+                log_stderr(
+                    f"[Main] Analysis quiescence after opening {target_file.name} seems complete."
+                )
+            # ---
+
+        # --- Workspace Symbols Delay (Still potentially useful) ---
+        # If workspaceSymbols is called without opening a specific file first,
+        # the initial progress wait might be enough, but a small delay could still help.
+        if args.command == "workspaceSymbols":
+            # If a file was opened, the quiescence wait likely covered indexing time.
+            # If no file was opened, rely more on the initial progress wait + maybe this delay.
+            needs_ws_delay = (
+                not target_file
+            )  # Only apply delay if no file was opened and waited for
+            workspace_query_delay = (
+                2.0 if needs_ws_delay else 0.5
+            )  # Shorter delay if quiescence already happened
+
+            if workspace_query_delay > 0:
+                log_stderr(
+                    f"[Main] Applying additional {workspace_query_delay}s delay before workspace symbol query..."
+                )
+                time.sleep(workspace_query_delay)
 
         lsp_response = None
 
@@ -581,17 +894,20 @@ def run_command(args):
 
     except (RuntimeError, TimeoutError, FileNotFoundError) as e:
         output["message"] = f"Client Error: {e}"
-        # Keep status as "error"
+        if ARGS and ARGS.verbose and hasattr(client, 'get_stderr_snapshot'):
+            output["stderr_snapshot"] = client.get_stderr_snapshot()
     except Exception as e:
         output["message"] = f"Unexpected Error: {e}"
-        # Keep status as "error"
-        # Consider adding traceback if verbose
         if ARGS and ARGS.verbose:
             import traceback
 
             output["traceback"] = traceback.format_exc()
+            if hasattr(client, 'get_stderr_snapshot'):
+                output["stderr_snapshot"] = client.get_stderr_snapshot()
     finally:
-        client.shutdown()
+        # Ensure client reference exists before calling shutdown
+        if 'client' in locals() and client:
+            client.shutdown()  # shutdown now mainly logs stderr if verbose
 
     # --- Final Output ---
     # Use print directly for final output to avoid log suppression
