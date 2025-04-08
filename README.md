@@ -1,6 +1,6 @@
 # Claude Analyzer for Rust
 
-This project provides tools to enhance Claude Code's ability to analyze and navigate Rust codebases using rust-analyzer.
+This project provides a tool to enhance Claude Code's ability to analyze and navigate Rust codebases using rust-analyzer.
 
 ## Overview
 
@@ -11,12 +11,11 @@ Claude Analyzer bridges the gap between Claude Code and rust-analyzer's semantic
 - Get type information and documentation
 - Search for symbols across an entire workspace
 
-## Tools
+## Tool
 
-This project contains two main tools:
+This project contains:
 
-1. **ra_tool.py**: A command-line interface to rust-analyzer that outputs in JSON or Markdown
-2. **ra_find_refs.py**: A specialized helper for finding references
+**ra_tool.py**: A command-line interface to rust-analyzer that outputs in JSON or Markdown
 
 ## Getting Started
 
@@ -33,9 +32,9 @@ This project contains two main tools:
    git clone https://github.com/yourusername/claude-analyzer.git
    ```
 
-2. Make the scripts executable (optional):
+2. Make the script executable (optional):
    ```bash
-   chmod +x ra_tool.py ra_find_refs.py
+   chmod +x ra_tool.py
    ```
 
 3. Ensure your tools have access to rust-analyzer:
@@ -67,7 +66,7 @@ claude-code --with-tools=/path/to/claude-analyzer
 ## Tool Documentation
 
 - See [ra_tool.md](ra_tool.md) for detailed documentation on `ra_tool.py`
-- See [CLAUDE.md](CLAUDE.md) for specific workflows that help Claude Code use these tools effectively
+- See [CLAUDE.md](CLAUDE.md) for specific workflows that help Claude Code use this tool effectively
 
 ## Tips for Effective Use
 
