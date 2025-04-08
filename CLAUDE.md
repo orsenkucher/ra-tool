@@ -10,6 +10,17 @@
 - Python 3 must be installed
 - rust-analyzer must be available in the environment
 
+## Error Handling
+
+When using ra_tool.py, always check for and report any errors back to the user. Common errors include:
+
+- JSON errors with `"status": "error"` indicating rust-analyzer issues
+- "content modified" errors when files have been modified but not saved
+- Connection errors if rust-analyzer can't be started
+- Command syntax errors if arguments are incorrect
+
+When an error occurs, immediately report it to the user and suggest possible solutions.
+
 ## Key Commands and Workflows
 
 ### Finding References
@@ -87,3 +98,13 @@ python3 ra_tool.py --format markdown workspaceSymbols TextMessageHandler
 ```
 
 Remember that line and column numbers are 1-based in ra_tool.py.
+
+## Error Handling Tips
+
+When encountering errors:
+1. Report any error messages to the user immediately
+2. Suggest troubleshooting steps (e.g., "Files may have been modified, please save all files and try again")
+3. Consider using `-v` flag to get more detailed diagnostic information
+4. Verify you're running from the project root directory
+
+Most common error solution is to save all files and try again to ensure rust-analyzer has the latest file content.
