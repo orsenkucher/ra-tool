@@ -47,20 +47,25 @@ This project contains:
 
 When working with Claude Code on a Rust project:
 
-1. Navigate to your Rust project directory
-2. Start Claude Code with access to the claude-analyzer tools
-3. Use the tools to help Claude analyze your code
+1. Navigate to your Rust project directory, copy `ra_tool.py` and `ra_tool.md` to it.
+2. Start Claude Code.
+3. Ask claude to read `ra-tool.md` to get instructions on how to invoke requests to rust-analyzer.
+4. Use the tools to help Claude analyze your code, ex. say "Finding MessageHandler with ra-tool". 
 
 Example workflow:
 
 ```bash
+# Copy script and documentation, make script chmod +x if needed
+cp ra-tool.md ra-tool.py /path/to/your/rust/project/
+
 # From your Rust project directory
 cd /path/to/your/rust/project
 
 # Start Claude Code with analyzer tools available
-claude-code --with-tools=/path/to/claude-analyzer
+claude
 
 # Now Claude can use the tools to help you with your Rust code
+> Hey, Claude! Please read ra_tool.md file and try playing with it to analyze this project.
 ```
 
 ## Tool Documentation
