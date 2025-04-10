@@ -11,6 +11,11 @@ Claude Analyzer bridges the gap between Claude Code and rust-analyzer's semantic
 - Get type information and documentation
 - Search for symbols across an entire workspace
 
+## Note
+`rust-analyzer` is not an HTTP server and communication with it happends via stdin stdout.
+In the current impl of the script we spin up new instance of rust-analyzer for each request, wait for it to be ready to serve response and then get result from it.
+This means it will take some time (2-30s) to get response, but at least you're not paying for this time.
+
 ## Tool
 
 This project contains:
