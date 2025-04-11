@@ -73,6 +73,8 @@ claude
 > Hey, Claude! Please read ra_tool.md file and try playing with it to analyze this project.
 ```
 
+![Example Claude Code Interaction](example.png)
+
 ## Tool Documentation
 
 - See [ra_tool.md](ra_tool.md) for detailed documentation on `ra_tool.py`
